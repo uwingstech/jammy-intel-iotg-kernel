@@ -196,9 +196,12 @@ static int tp_event_has_id(const char *dir_path, struct dirent *evt_dir)
 void parse_events__handle_error(struct parse_events_error *err, int idx,
 				char *str, char *help)
 {
-	if (WARN(!str, "WARNING: failed to provide error string\n")) {
-		free(help);
-		return;
+	if (WARN(!str, "WARNING: failed to provide error string\n"))
+		goto out_free;
+	if (!err) {
+		/* Assume caller does not want message printed */
+		pr_debug("event syntax error: %s\n", str);
+		goto out_free;
 	}
 	switch (err->num_errors) {
 	case 0:
@@ -224,6 +227,11 @@ void parse_events__handle_error(struct parse_events_error *err, int idx,
 		break;
 	}
 	err->num_errors++;
+	return;
+
+out_free:
+	free(str);
+	free(help);
 }
 
 struct tracepoint_path *tracepoint_id_to_path(u64 config)
@@ -1529,7 +1537,9 @@ int parse_events_add_pmu(struct parse_events_state *parse_state,
 	bool use_uncore_alias;
 	LIST_HEAD(config_terms);
 
-	if (verbose > 1) {
+	pmu = parse_state->fake_pmu ?: perf_pmu__find(name);
+
+	if (verbose > 1 && !(pmu && pmu->selectable)) {
 		fprintf(stderr, "Attempting to add event pmu '%s' with '",
 			name);
 		if (head_config) {
@@ -1542,7 +1552,6 @@ int parse_events_add_pmu(struct parse_events_state *parse_state,
 		fprintf(stderr, "' that may result in non-fatal errors\n");
 	}
 
-	pmu = parse_state->fake_pmu ?: perf_pmu__find(name);
 	if (!pmu) {
 		char *err_str;
 
@@ -2703,7 +2712,7 @@ next:
 	return 0;
 }
 
-static bool is_event_supported(u8 type, unsigned config)
+static bool is_event_supported(u8 type, u64 config)
 {
 	bool ret = true;
 	int open_return;
@@ -2823,10 +2832,18 @@ void print_sdt_events(const char *subsys_glob, const char *event_glob,
 
 int print_hwcache_events(const char *event_glob, bool name_only)
 {
-	unsigned int type, op, i, evt_i = 0, evt_num = 0;
-	char name[64];
-	char **evt_list = NULL;
+	unsigned int type, op, i, evt_i = 0, evt_num = 0, npmus = 0;
+	char name[64], new_name[128];
+	char **evt_list = NULL, **evt_pmus = NULL;
 	bool evt_num_known = false;
+	struct perf_pmu *pmu = NULL;
+
+	if (perf_pmu__has_hybrid()) {
+		npmus = perf_pmu__hybrid_pmu_num();
+		evt_pmus = zalloc(sizeof(char *) * npmus);
+		if (!evt_pmus)
+			goto out_enomem;
+	}
 
 restart:
 	if (evt_num_known) {
@@ -2842,20 +2859,61 @@ restart:
 				continue;
 
 			for (i = 0; i < PERF_COUNT_HW_CACHE_RESULT_MAX; i++) {
+				unsigned int hybrid_supported = 0, j;
+				bool supported;
+
 				__evsel__hw_cache_type_op_res_name(type, op, i, name, sizeof(name));
 				if (event_glob != NULL && !strglobmatch(name, event_glob))
 					continue;
 
-				if (!is_event_supported(PERF_TYPE_HW_CACHE,
-							type | (op << 8) | (i << 16)))
-					continue;
+				if (!perf_pmu__has_hybrid()) {
+					if (!is_event_supported(PERF_TYPE_HW_CACHE,
+								type | (op << 8) | (i << 16))) {
+						continue;
+					}
+				} else {
+					perf_pmu__for_each_hybrid_pmu(pmu) {
+						if (!evt_num_known) {
+							evt_num++;
+							continue;
+						}
+
+						supported = is_event_supported(
+									PERF_TYPE_HW_CACHE,
+									type | (op << 8) | (i << 16) |
+									((__u64)pmu->type << PERF_PMU_TYPE_SHIFT));
+						if (supported) {
+							snprintf(new_name, sizeof(new_name), "%s/%s/",
+								 pmu->name, name);
+							evt_pmus[hybrid_supported] = strdup(new_name);
+							hybrid_supported++;
+						}
+					}
+
+					if (hybrid_supported == 0)
+						continue;
+				}
 
 				if (!evt_num_known) {
 					evt_num++;
 					continue;
 				}
 
-				evt_list[evt_i] = strdup(name);
+				if ((hybrid_supported == 0) ||
+				    (hybrid_supported == npmus)) {
+					evt_list[evt_i] = strdup(name);
+					if (npmus > 0) {
+						for (j = 0; j < npmus; j++)
+							zfree(&evt_pmus[j]);
+					}
+				} else {
+					for (j = 0; j < hybrid_supported; j++) {
+						evt_list[evt_i++] = evt_pmus[j];
+						evt_pmus[j] = NULL;
+					}
+					continue;
+				}
+
 				if (evt_list[evt_i] == NULL)
 					goto out_enomem;
 				evt_i++;
@@ -2867,6 +2925,13 @@ restart:
 		evt_num_known = true;
 		goto restart;
 	}
+
+	for (evt_i = 0; evt_i < evt_num; evt_i++) {
+		if (!evt_list[evt_i])
+			break;
+	}
+
+	evt_num = evt_i;
 	qsort(evt_list, evt_num, sizeof(char *), cmp_string);
 	evt_i = 0;
 	while (evt_i < evt_num) {
@@ -2885,6 +2950,10 @@ out_free:
 	for (evt_i = 0; evt_i < evt_num; evt_i++)
 		zfree(&evt_list[evt_i]);
 	zfree(&evt_list);
+
+	for (evt_i = 0; evt_i < npmus; evt_i++)
+		zfree(&evt_pmus[evt_i]);
+	zfree(&evt_pmus);
 	return evt_num;
 
 out_enomem:
@@ -2994,7 +3063,8 @@ out_enomem:
  * Print the help text for the event symbols:
  */
 void print_events(const char *event_glob, bool name_only, bool quiet_flag,
-			bool long_desc, bool details_flag, bool deprecated)
+			bool long_desc, bool details_flag, bool deprecated,
+			const char *pmu_name)
 {
 	print_symbol_events(event_glob, PERF_TYPE_HARDWARE,
 			    event_symbols_hw, PERF_COUNT_HW_MAX, name_only);
@@ -3006,7 +3076,7 @@ void print_events(const char *event_glob, bool name_only, bool quiet_flag,
 	print_hwcache_events(event_glob, name_only);
 
 	print_pmu_events(event_glob, name_only, quiet_flag, long_desc,
-			details_flag, deprecated);
+			details_flag, deprecated, pmu_name);
 
 	if (event_glob != NULL)
 		return;
@@ -3032,7 +3102,8 @@ void print_events(const char *event_glob, bool name_only, bool quiet_flag,
 
 	print_sdt_events(NULL, NULL, name_only);
 
-	metricgroup__print(true, true, NULL, name_only, details_flag);
+	metricgroup__print(true, true, NULL, name_only, details_flag,
+			   pmu_name);
 
 	print_libpfm_events(name_only, long_desc);
 }

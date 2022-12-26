@@ -218,7 +218,7 @@ void iwl_force_nmi(struct iwl_trans *trans)
 				    UREG_DOORBELL_TO_ISR6_NMI_BIT);
 	else
 		iwl_write32(trans, CSR_DOORBELL_VECTOR,
-			    CSR_DOORBELL_VECTOR_NMI);
+			    UREG_DOORBELL_TO_ISR6_NMI_BIT);
 }
 IWL_EXPORT_SYMBOL(iwl_force_nmi);
 
@@ -398,9 +398,9 @@ int iwl_dump_fh(struct iwl_trans *trans, char **buf)
 	return 0;
 }
 
-int iwl_finish_nic_init(struct iwl_trans *trans,
-			const struct iwl_cfg_trans_params *cfg_trans)
+int iwl_finish_nic_init(struct iwl_trans *trans)
 {
+	const struct iwl_cfg_trans_params *cfg_trans = trans->trans_cfg;
 	u32 poll_ready;
 	int err;
 

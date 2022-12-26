@@ -1180,6 +1180,12 @@ void mark_tsc_unstable(char *reason)
 
 EXPORT_SYMBOL_GPL(mark_tsc_unstable);
 
+static void __init tsc_disable_clocksource_watchdog(void)
+{
+	clocksource_tsc_early.flags &= ~CLOCK_SOURCE_MUST_VERIFY;
+	clocksource_tsc.flags &= ~CLOCK_SOURCE_MUST_VERIFY;
+}
+
 static void __init check_system_tsc_reliable(void)
 {
 #if defined(CONFIG_MGEODEGX1) || defined(CONFIG_MGEODE_LX) || defined(CONFIG_X86_GENERIC)
@@ -1196,6 +1202,23 @@ static void __init check_system_tsc_reliable(void)
 #endif
 	if (boot_cpu_has(X86_FEATURE_TSC_RELIABLE))
 		tsc_clocksource_reliable = 1;
+
+	/*
+	 * Disable the clocksource watchdog when the system has:
+	 *  - TSC running at constant frequency
+	 *  - TSC which does not stop in C-States
+	 *  - the TSC_ADJUST register which allows to detect even minimal
+	 *    modifications
+	 *  - not more than two sockets. As the number of sockets cannot be
+	 *    evaluated at the early boot stage where this has to be
+	 *    invoked, check the number of online memory nodes as a
+	 *    fallback solution which is an reasonable estimate.
+	 */
+	if (boot_cpu_has(X86_FEATURE_CONSTANT_TSC) &&
+	    boot_cpu_has(X86_FEATURE_NONSTOP_TSC) &&
+	    boot_cpu_has(X86_FEATURE_TSC_ADJUST) &&
+	    nr_online_nodes <= 2)
+		tsc_disable_clocksource_watchdog();
 }
 
 /*
@@ -1233,7 +1256,7 @@ int unsynchronized_tsc(void)
 /*
  * Convert ART to TSC given numerator/denominator found in detect_art()
  */
-struct system_counterval_t convert_art_to_tsc(u64 art)
+static struct system_counterval_t _convert_art_to_tsc(u64 art, bool dur)
 {
 	u64 tmp, res, rem;
 
@@ -1243,12 +1266,124 @@ struct system_counterval_t convert_art_to_tsc(u64 art)
 	tmp = rem * art_to_tsc_numerator;
 
 	do_div(tmp, art_to_tsc_denominator);
-	res += tmp + art_to_tsc_offset;
+	res += tmp;
+	if (!dur)
+		res += art_to_tsc_offset;
 
 	return (struct system_counterval_t) {.cs = art_related_clocksource,
 			.cycles = res};
 }
+
+struct system_counterval_t convert_art_to_tsc(u64 art)
+{
+	return _convert_art_to_tsc(art, false);
+}
 EXPORT_SYMBOL(convert_art_to_tsc);
+
+static
+struct timespec64 get_tsc_ns(struct system_counterval_t *system_counter)
+{
+	u64 tmp, res, rem;
+	u64 cycles;
+
+	cycles = system_counter->cycles;
+	rem = do_div(cycles, tsc_khz);
+
+	res = cycles * USEC_PER_SEC;
+	tmp = rem * USEC_PER_SEC;
+
+	rem = do_div(tmp, tsc_khz);
+	tmp += rem > tsc_khz >> 2 ? 1 : 0;
+	res += tmp;
+
+	rem = do_div(res, NSEC_PER_SEC);
+
+	return (struct timespec64) {.tv_sec = res, .tv_nsec = rem};
+}
+
+struct timespec64 get_tsc_ns_now(struct system_counterval_t *system_counter)
+{
+	struct system_counterval_t counterval;
+
+	if (system_counter == NULL)
+		system_counter = &counterval;
+
+	system_counter->cycles = clocksource_tsc.read(NULL);
+	system_counter->cs = art_related_clocksource;
+
+	return get_tsc_ns(system_counter);
+}
+EXPORT_SYMBOL(get_tsc_ns_now);
+
+struct timespec64 convert_art_to_tsc_ns(u64 art)
+{
+	struct system_counterval_t counterval;
+
+	counterval = _convert_art_to_tsc(art, false);
+
+	return get_tsc_ns(&counterval);
+}
+EXPORT_SYMBOL(convert_art_to_tsc_ns);
+
+struct timespec64 convert_art_to_tsc_ns_duration(u64 art)
+{
+	struct system_counterval_t counterval;
+
+	counterval = _convert_art_to_tsc(art, true);
+
+	return get_tsc_ns(&counterval);
+}
+EXPORT_SYMBOL(convert_art_to_tsc_ns_duration);
+
+static u64 convert_tsc_ns_to_tsc(struct timespec64 *tsc_ns)
+{
+	u64 tmp, res, rem;
+	u64 cycles;
+
+	cycles = timespec64_to_ns(tsc_ns);
+
+	rem = do_div(cycles, USEC_PER_SEC);
+
+	res = cycles * tsc_khz;
+	tmp = rem * tsc_khz;
+
+	do_div(tmp, USEC_PER_SEC);
+
+	return res + tmp;
+}
+
+
+static u64 _convert_tsc_ns_to_art(struct timespec64 *tsc_ns, bool dur)
+{
+	u64 tmp, res, rem;
+	u64 cycles;
+
+	cycles = convert_tsc_ns_to_tsc(tsc_ns);
+	if (!dur)
+		cycles -= art_to_tsc_offset;
+
+	rem = do_div(cycles, art_to_tsc_numerator);
+
+	res = cycles * art_to_tsc_denominator;
+	tmp = rem * art_to_tsc_denominator;
+
+	rem = do_div(tmp, art_to_tsc_numerator);
+	tmp += rem > art_to_tsc_numerator >> 2 ? 1 : 0;
+
+	return res + tmp;
+}
+
+u64 convert_tsc_ns_to_art(struct timespec64 *tsc_ns)
+{
+	return _convert_tsc_ns_to_art(tsc_ns, false);
+}
+EXPORT_SYMBOL(convert_tsc_ns_to_art);
+
+u64 convert_tsc_ns_to_art_duration(struct timespec64 *tsc_ns)
+{
+	return _convert_tsc_ns_to_art(tsc_ns, true);
+}
+EXPORT_SYMBOL(convert_tsc_ns_to_art_duration);
 
 /**
  * convert_art_ns_to_tsc() - Convert ART in nanoseconds to TSC.
@@ -1387,9 +1522,6 @@ static int __init init_tsc_clocksource(void)
 	if (tsc_unstable)
 		goto unreg;
 
-	if (tsc_clocksource_reliable || no_tsc_watchdog)
-		clocksource_tsc.flags &= ~CLOCK_SOURCE_MUST_VERIFY;
-
 	if (boot_cpu_has(X86_FEATURE_NONSTOP_TSC_S3))
 		clocksource_tsc.flags |= CLOCK_SOURCE_SUSPEND_NONSTOP;
 
@@ -1501,6 +1633,11 @@ void __init tsc_init(void)
 		return;
 	}
 
+	if (tsc_clocksource_reliable || no_tsc_watchdog) {
+		clocksource_tsc.flags &= ~CLOCK_SOURCE_MUST_VERIFY;
+		clocksource_tsc_early.flags &= ~CLOCK_SOURCE_MUST_VERIFY;
+	}
+
 	if (!tsc_khz) {
 		/* We failed to determine frequencies earlier, try again */
 		if (!determine_cpu_tsc_frequencies(false)) {
@@ -1527,7 +1664,7 @@ void __init tsc_init(void)
 	}
 
 	if (tsc_clocksource_reliable || no_tsc_watchdog)
-		clocksource_tsc_early.flags &= ~CLOCK_SOURCE_MUST_VERIFY;
+		tsc_disable_clocksource_watchdog();
 
 	clocksource_register_khz(&clocksource_tsc_early, tsc_khz);
 	detect_art();

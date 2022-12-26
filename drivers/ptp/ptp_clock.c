@@ -169,6 +169,9 @@ static void ptp_clock_release(struct device *dev)
 {
 	struct ptp_clock *ptp = container_of(dev, struct ptp_clock, dev);
 
+	/* Release the clock's resources. */
+	if (ptp->pps_source)
+		pps_unregister_source(ptp->pps_source);
 	ptp_cleanup_pin_groups(ptp);
 	kfree(ptp->vclock_index);
 	mutex_destroy(&ptp->tsevq_mux);
@@ -189,6 +192,17 @@ static void ptp_aux_kworker(struct kthread_work *work)
 
 	if (delay >= 0)
 		kthread_queue_delayed_work(ptp->kworker, &ptp->aux_work, delay);
+}
+
+static bool check_for_readability(struct ptp_pin_desc *pin_desc, size_t size)
+{
+	int i;
+	unsigned int flags = PTP_PINDESC_INPUTPOLL;
+
+	for (i = 0; i < size && flags != 0; ++i)
+		flags &= pin_desc[i].flags;
+
+	return flags == 0;
 }
 
 /* public interface */
@@ -214,6 +228,8 @@ struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
 		err = index;
 		goto no_slot;
 	}
+
+	ptp->defunct = !check_for_readability(info->pin_config, info->n_pins);
 
 	ptp->clock.ops = ptp_clock_ops;
 	ptp->info = info;
@@ -317,11 +333,18 @@ no_memory:
 }
 EXPORT_SYMBOL(ptp_clock_register);
 
+static int unregister_vclock(struct device *dev, void *data)
+{
+	struct ptp_clock *ptp = dev_get_drvdata(dev);
+
+	ptp_vclock_unregister(info_to_vclock(ptp->info));
+	return 0;
+}
+
 int ptp_clock_unregister(struct ptp_clock *ptp)
 {
 	if (ptp_vclock_in_use(ptp)) {
-		pr_err("ptp: virtual clock in use\n");
-		return -EBUSY;
+		device_for_each_child(&ptp->dev, NULL, unregister_vclock);
 	}
 
 	ptp->defunct = 1;
@@ -331,11 +354,6 @@ int ptp_clock_unregister(struct ptp_clock *ptp)
 		kthread_cancel_delayed_work_sync(&ptp->aux_work);
 		kthread_destroy_worker(ptp->kworker);
 	}
-
-	/* Release the clock's resources. */
-	if (ptp->pps_source)
-		pps_unregister_source(ptp->pps_source);
-
 	posix_clock_unregister(&ptp->clock);
 
 	return 0;
